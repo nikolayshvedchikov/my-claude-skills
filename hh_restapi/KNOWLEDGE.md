@@ -1,6 +1,6 @@
 # KNOWLEDGE.md — HH.RU HR Ассистент: журнал отладки и реализации
 
-> Последнее обновление: 2026-04-19 (сессия 2, ~22:00 MSK). Читай этот файл перед началом работы.
+> Последнее обновление: 2026-04-19 (сессия 3, ~20:30 MSK). Читай этот файл перед началом работы.
 
 ---
 
@@ -18,8 +18,8 @@ n8n: HH.RU HR Ассистент (ID: 4LXW8oTh168CnTqy)
 [E-цепочка] Ночной прогон 23:00 → статистика + GitHub backup
 
 n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
-  → GET /employers/{employer_id}/vacancies (fallback: hardcoded vacancy)
-  → GET /negotiations/response?vacancy_id=...&per_page=50&page=0
+  → GET /employers/3565638/vacancies
+  → GET /negotiations/response?vacancy_id=...
   → POST webhook/hh-events если нашёл новые
 ```
 
@@ -35,7 +35,7 @@ n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
 | n8n password | zFP&T1Ok |
 | HH.RU employer ID | 3565638 (Экстраверт) |
 | HH.RU manager ID | 4424964 |
-| HH.RU token | USERK2LG6I3D4C3JH9BJ6IO6BJVBM5OONJDARBHTO9PBJE277OIMIAOVJCC9PMDL |
+| HH.RU token | YOUR_HH_TOKEN |
 | Webhook path | /webhook/hh-events |
 | Main workflow ID | 4LXW8oTh168CnTqy |
 | Poller workflow ID | swW1Www0gmme6Yvi |
@@ -48,9 +48,7 @@ n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
 - Новый n8n (>1.x) возвращает cookie `n8n-auth`, НЕ токен в теле
 - Для запросов: `-b "n8n-auth=<cookie>"`
 - Обновление workflow: `PATCH /rest/workflows/{id}` (не PUT!)
-- Деактивация: `POST /rest/workflows/{id}/deactivate`
-- Активация: `POST /rest/workflows/{id}/activate` с телом `{"versionId":"<VID>"}`
-- **ВАЖНО**: после PATCH расписание не перезагружается — нужна деактивация + активация!
+- Перед PATCH не нужно вручную обновлять versionId — n8n сам управляет
 
 ---
 
@@ -66,7 +64,7 @@ n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
 - `/negotiations/response` требует обязательный параметр `vacancy_id`
 - `/me` для работодателя: поле `employer.id` = 3565638, `employer.manager_id` = 4424964
 - `/vacancies?mine=true` — возвращает НЕ вакансии работодателя (это вакансии менеджера/кандидата!)
-- `/employers/3565638/vacancies` — возвращает 0 активных вакансий (404 not_found или пустой список)
+- `/employers/3565638/vacancies/active` — у текущего аккаунта 0 активных вакансий
 - Для получения вакансий работодателя: `/vacancies?manager_id={manager_id}` — НО это возвращает 859к чужих вакансий!
 - Тестовая вакансия: `130853744` ("Начинающий специалист по внедрению Битрикс24"), архивная
 - На архивной вакансии: 156 откликов (found: 156)
@@ -99,7 +97,52 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 ---
 
-## 6. Сессия 2026-04-19: что сделано
+## 6. Сессия 3 (2026-04-19, ~20:30 MSK): что сделано
+
+### КРИТИЧЕСКИЙ БАГ: jsonBody-выражения не вычислялись
+
+Все узлы Claude (C2, A2, A6) использовали `specifyBody: "json"` с `jsonBody` без префикса `=`. В результате `{{ }}` выражения отправлялись в Claude буквально, и Claude отвечал "Я не вижу данных из переменных шаблона" вместо JSON.
+
+**Исправление:** переключить на `jsonBody` с префиксом `=` (expression mode), который вычисляет `JSON.stringify({...})` с реальными данными узлов:
+```
+"jsonBody": "={{ JSON.stringify({ model: ..., messages: [{ content: ... + $json.field + ... }] }) }}"
+```
+
+### Что исправлено:
+1. **C2 Оценить резюме (Claude)** — jsonBody → expression mode, модель → `claude-haiku-4-5-20251001`
+2. **A2 Сгенерировать вопрос (Claude)** — то же исправление
+3. **A6 Сформировать текст вакансии** — то же исправление
+4. **Workflow активация** — воркфлоу был `active=False`. После активации `/webhook/hh-events` → 200.
+5. **Telegram Trigger** — UUID исправлен (`id` = UUID, `webhookId` = UUID). Polling mode.
+
+### Результат теста C-цепочки (execution #2324) — УСПЕХ:
+```json
+{
+  "nid": "5169546644",
+  "score": 2,
+  "verdict": "fail",
+  "comment": "Отсутствует информация об опыте работы и навыках...",
+  "rejectionText": "Уважаемая Антонина! Спасибо за интерес к вакансии...",
+  "candidateName": "Данилкова Антонина",
+  "vacancyName": "Начинающий специалист по внедрению Битрикс24"
+}
+```
+
+### ВАЖНО — n8n Telegram Trigger: polling mode, не webhook
+`n8n-nodes-base.telegramTrigger` использует **polling mode**. Путь `/webhook/{webhookId}` → 404 — это нормально! n8n сам опрашивает `getUpdates`. Не тестируй TG trigger через HTTP POST к webhook path.
+
+### Текущее состояние (конец сессии 3):
+- ✅ C-цепочка: C1→C2→C2b→C3 работает (score, verdict, rejection text)
+- ✅ Главный флоу: active=True, webhook /webhook/hh-events → 200
+- ✅ C2/A2/A6: jsonBody expression mode исправлен
+- ✅ Telegram Trigger: polling mode, UUID/webhookId корректны
+- ⏸️ C4/C5/C7/C8: отключены (dry mode)
+- ❓ A-цепочка: не тестировалась end-to-end
+- ❓ Активные вакансии HH.RU: поллер использует fallback 130853744
+
+---
+
+## 6б. Сессия 2026-04-19 (сессия 2): что было сделано
 
 ### Исправлено в n8n (живой экземпляр):
 1. **Поллер** — URL исправлен: `/negotiations?` → `/negotiations/response?`
@@ -111,46 +154,37 @@ curl -s -X POST -H 'Content-Type: application/json' \
 7. **Главный флоу** — E2 URL исправлен: `/negotiations?` → `/negotiations/response?`
 
 ### Результаты dry-test главного флоу (execution #2302):
-- Webhook → Filter → Switch → C1 → C2(Claude) → C2b → C3 → C4(disabled) → C5(disabled)
-- **C1**: успешно получил данные переговоров от HH.RU ✅
-- **C2**: Claude API вызван, резюме Данилковой оценено ✅
-- **C2b**: ответ Claude разобран ✅
-- **C3**: score < 4 → ветка отказа ✅
-- **C4/C5**: отключены → сообщения НЕ отправлены ✅ (dry run)
-
-### Результаты dry-test поллера (execution #2305):
-- Trigger → Вакансии (404, continueRegularOutput) → Извлечь IDs (fallback: 130853744) → Отклики → Фильтр (0 новых) → стоп
-- **Статус**: success ✅ — все 6 нод прошли
-- **Нет новых откликов**: ожидаемо — staticData.lastProcessedMap[130853744] уже на Данилковой
+- C1: успешно получил данные переговоров от HH.RU ✅
+- C2: Claude API вызван, резюме Данилковой оценено ✅
+- C2b: ответ Claude разобран ✅
+- C3: score < 4 → ветка отказа ✅
+- C4/C5: отключены → сообщения НЕ отправлены ✅ (dry run)
 
 ### ВАЖНО — n8n кеширует расписание:
-После PATCH воркфлоу расписание продолжает выполнять СТАРУЮ версию из памяти.  
+После PATCH воркфлоу расписание выполняет СТАРУЮ версию из памяти.  
 **Решение**: деактивировать → реактивировать:
 ```bash
 curl -s -X POST -b "n8n-auth=<COOKIE>" https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/deactivate
-VID=$(curl -s -b "n8n-auth=<COOKIE>" https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['versionId'])")
-curl -s -X POST -b "n8n-auth=<COOKIE>" -H "Content-Type: application/json" -d "{\"versionId\":\"$VID\"}" \
+curl -s -X POST -b "n8n-auth=<COOKIE>" -H "Content-Type: application/json" -d '{"versionId":"<VID>"}' \
   https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/activate
 ```
 
-### Что ещё нужно сделать перед боевым запуском:
-1. Включить C4/C5/C7/C8 обратно (убрать `disabled: true`)
-2. Протестировать отправку сообщения Данилковой в рабочее время (с её согласия)
-3. Убедиться что HH.RU webhook шлёт `NEW_RESPONSE_OR_INVITATION_VACANCY`
-4. Решить проблему поллера с активными вакансиями (см. раздел 7)
-5. Проверить Bitrix24 и Telegram интеграции
+### Что нужно сделать перед боевым запуском:
+1. **Включить C4/C5/C7/C8** (убрать `disabled: true`) — перед первым боевым тестом
+2. Протестировать A-цепочку: написать боту → вопросы → вакансия → одобрить → опубликовать
+3. Решить проблему поллера с активными вакансиями (см. раздел 7)
+4. После включения C4/C5 — протестировать отправку сообщения кандидату
 
 ---
 
 ## 7. Поллер — проблема с вакансиями работодателя
 
-Поллер использует `GET /employers/3565638/vacancies` — но возвращает 0 активных вакансий.  
-Код-нода `🔢 Извлечь ID вакансий` автоматически использует fallback: `vacancy_id = '130853744'`.
+Поллер использует `GET /employers/3565638/vacancies` — но возвращает 0 активных вакансий.
 
-Варианты долгосрочного решения:
-- Жёстко задать список активных вакансий в Static Data поллера
+Варианты решения:
+- Жёстко задать список вакансий в Static Data поллера
 - Использовать другой endpoint для получения вакансий менеджера
-- Зарегистрировать настоящий HH.RU webhook (не поллинг) — тогда поллер не нужен вообще
+- Зарегистрировать настоящий HH.RU webhook (не поллинг)
 
 ---
 
@@ -177,17 +211,6 @@ curl -s -X PATCH -b "n8n-auth=$COOKIE" \
   -H "Content-Type: application/json" \
   -d '<FULL_WORKFLOW_JSON>' \
   https://oburscuforring.beget.app/rest/workflows/4LXW8oTh168CnTqy
-
-# Деактивировать воркфлоу
-curl -s -X POST -b "n8n-auth=$COOKIE" \
-  https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/deactivate
-
-# Активировать воркфлоу (нужен versionId)
-VID=$(curl -s -b "n8n-auth=$COOKIE" https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['versionId'])")
-curl -s -X POST -b "n8n-auth=$COOKIE" -H "Content-Type: application/json" \
-  -d "{\"versionId\":\"$VID\"}" \
-  https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/activate
 ```
 
 ---
@@ -198,7 +221,7 @@ curl -s -X POST -b "n8n-auth=$COOKIE" -H "Content-Type: application/json" \
 
 Файлы:
 - `main_flow_ready.json` — главный workflow с плейсхолдерами
-- `poller_flow.json` — поллер workflow (6-нодовый, с плейсхолдерами)
+- `poller_flow.json` — поллер workflow с плейсхолдерами
 - `README.md` — архитектура, тест-план, таблица замены плейсхолдеров
 - `KNOWLEDGE.md` — этот файл
 
@@ -210,16 +233,17 @@ curl -s -X POST -b "n8n-auth=$COOKIE" -H "Content-Type: application/json" \
 
 1. Прочитай этот файл
 2. Залогинься в n8n через cookie (раздел 8)
-3. Включи C4/C5/C7/C8 обратно: PATCH главного флоу, убери `"disabled": true` у этих нод
-4. После PATCH — деактивируй и реактивируй главный флоу (раздел 6, блок n8n кеш)
-5. Реши проблему поллера с активными вакансиями: либо хардкод вакансий в staticData, либо HH.RU webhook
-6. Протестируй с Данилковой в рабочее время (попроси её ответить на новое тестовое сообщение)
-7. Проверь что HH.RU webhook шлёт правильный тип события
+3. Убедись что главный флоу активен: `GET /rest/workflows/4LXW8oTh168CnTqy` → `active=true`
+4. Если нужен продакшн: включи C4/C5/C7/C8 — убери `"disabled": true` у этих нод через PATCH
+5. Протестируй A-цепочку: напиши в Telegram-бот, убедись что получаешь вопросы и вакансию
+6. Реши проблему поллера с активными вакансиями (раздел 7)
 
-### Текущее состояние системы (конец сессии 2):
-- ✅ Поллер: работает (execution 2305 — success, все 6 нод)
-- ✅ Главный флоу: работает в dry-mode (C4/C5/C7/C8 отключены)
-- ✅ Claude оценивает резюме корректно
-- ✅ staticData поллера: lastProcessedMap[130853744] = 2026-04-16T09:32:06+0300
-- ⏸️ Отправка кандидатам: отключена (dry mode)
+### Текущее состояние системы (конец сессии 3):
+- ✅ Поллер: работает (каждые 5 минут, execution 2326 — success)
+- ✅ Главный флоу: active=True, versionId ~31f38491
+- ✅ C-цепочка: Claude оценивает резюме (score, verdict, rejection text)
+- ✅ C2/A2/A6: исправлен jsonBody expression mode
+- ✅ Telegram Trigger: polling mode, UUID/webhookId корректны
+- ⏸️ C4/C5/C7/C8: отключены (dry mode)
+- ❓ A-цепочка: не тестировалась end-to-end
 - ❓ Активные вакансии HH.RU: не найдены через API, поллер использует fallback 130853744
