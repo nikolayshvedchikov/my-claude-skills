@@ -1,0 +1,470 @@
+{
+  "name": "HH.RU HR Ассистент",
+  "_readme": "Replace YOUR_HH_TOKEN with a valid HH.RU employer user token, and YOUR_ANTHROPIC_KEY with your Anthropic API key before importing.",
+  "nodes": [
+    {
+      "id": "hh-webhook",
+      "name": "🔔 HH.RU Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [400, 80],
+      "webhookId": "hh-hr-events",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hh-events",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "telegram-trigger",
+      "name": "🤖 Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [900, 80],
+      "credentials": {"telegramApi": {"id": "telegram-bot-cred", "name": "Telegram Bot"}},
+      "parameters": {"updates": ["message", "callback_query"], "additionalFields": {}}
+    },
+    {
+      "id": "schedule-trigger",
+      "name": "⏰ Ночной прогон 23:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [1400, 80],
+      "parameters": {"rule": {"interval": [{"field": "cronExpression", "expression": "0 23 * * *"}]}}
+    },
+    {
+      "id": "filter-vacancy-id",
+      "name": "🛡️ Только тестовая вакансия",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [400, 80],
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"},
+          "conditions": [{"id": "cond-vacancy-filter", "leftValue": "={{ $json.body.vacancy_id || $json.body.object?.vacancy_id || '' }}", "rightValue": "130853744", "operator": {"type": "string", "operation": "equals"}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "ТЕСТ: пропускаем только вакансию 130853744. Перед продакшном удалить эту ноду."
+    },
+    {
+      "id": "hh-event-switch",
+      "name": "📍 HH Тип события",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [400, 280],
+      "parameters": {
+        "mode": "rules",
+        "rules": {"values": [
+          {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"}, "conditions": [{"id": "cond-new-response", "leftValue": "={{ $json.body.type }}", "rightValue": "NEW_RESPONSE_OR_INVITATION_VACANCY", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "Новый отклик"},
+          {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"}, "conditions": [{"id": "cond-chat-type", "leftValue": "={{ $json.body.type }}", "rightValue": "CHAT_MESSAGE_CREATED", "operator": {"type": "string", "operation": "equals"}}, {"id": "cond-chat-role", "leftValue": "={{ $json.body.message.author.participant_type }}", "rightValue": "APPLICANT", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "Ответ кандидата"}
+        ]},
+        "options": {"fallbackOutput": "none"}
+      }
+    },
+    {
+      "id": "telegram-type-if",
+      "name": "📍 Telegram Тип",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 280],
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"}, "conditions": [{"id": "cond-callback", "leftValue": "={{ $json.callback_query !== undefined }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}}
+    },
+    {
+      "id": "c1-get-negotiation",
+      "name": "C1 Получить данные отклика",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [200, 480],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.hh.ru/negotiations/{{ $json.body.object.id }}",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}]},
+        "options": {}
+      }
+    },
+    {
+      "id": "c2-score-resume",
+      "name": "C2 Оценить резюме (Claude)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [200, 680],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "x-api-key", "value": "YOUR_ANTHROPIC_KEY"}, {"name": "anthropic-version", "value": "2023-06-01"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "options": {},
+        "specifyBody": "json",
+        "jsonBody": "{\"model\": \"claude-haiku-4-5\", \"max_tokens\": 1024, \"system\": \"Ты HR-ассистент. Оцени резюме кандидата по шкале 1-10 для данной вакансии. Верни JSON: {\\\"score\\\": number, \\\"verdict\\\": \\\"pass\\\"|\\\"fail\\\", \\\"comment\\\": \\\"краткое пояснение\\\", \\\"rejection_text\\\": \\\"вежливый отказ если verdict=fail\\\", \\\"first_question\\\": \\\"первый квалификационный вопрос если verdict=pass\\\"}. Отвечай только JSON, без markdown.\", \"messages\": [{\"role\": \"user\", \"content\": \"Вакансия: {{ $('C1 Получить данные отклика').first().json.vacancy.name }}\\n\\nКандидат: {{ $('C1 Получить данные отклика').first().json.resume.last_name }} {{ $('C1 Получить данные отклика').first().json.resume.first_name }}\\n\\nОпыт:\\n{{ $('C1 Получить данные отклика').first().json.resume.experience ? $('C1 Получить данные отклика').first().json.resume.experience.map(e => e.company + ': ' + e.position + ' (' + (e.description || '') + ')').join('\\\\n') : 'не указан' }}\\n\\nНавыки: {{ $('C1 Получить данные отклика').first().json.resume.skill_set ? $('C1 Получить данные отклика').first().json.resume.skill_set.join(', ') : 'не указаны' }}\"}]}"
+      }
+    },
+    {
+      "id": "c2-parse-score",
+      "name": "C2b Разобрать ответ Claude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [200, 800],
+      "parameters": {
+        "jsCode": "const inp = $input.item.json;\nconst rawText = Array.isArray(inp.content) ? inp.content[0].text : JSON.stringify(inp);\nlet raw = rawText.trim();\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch(e1) {\n  const m = raw.match(/```(?:json)?\\s*([\\s\\S]*?)\\s*```/);\n  if (m) {\n    try { parsed = JSON.parse(m[1].trim()); }\n    catch(e2) { throw new Error('Claude block not JSON: ' + m[1].substring(0,150)); }\n  } else {\n    const s = raw.indexOf('{'); const e = raw.lastIndexOf('}');\n    if (s !== -1 && e > s) {\n      try { parsed = JSON.parse(raw.substring(s, e+1)); }\n      catch(e3) { throw new Error('No valid JSON in Claude response: ' + raw.substring(0,150)); }\n    } else {\n      throw new Error('No JSON object in Claude response: ' + raw.substring(0,150));\n    }\n  }\n}\nconst negData = $('C1 Получить данные отклика').first().json;\nreturn {\n  nid: negData.id?.toString(),\n  score: parsed.score,\n  verdict: parsed.verdict,\n  comment: parsed.comment,\n  rejectionText: parsed.rejection_text || '',\n  firstQuestion: parsed.first_question || '',\n  candidateName: negData.resume?.last_name + ' ' + negData.resume?.first_name,\n  resumeSummary: parsed.comment,\n  vacancyId: negData.vacancy?.id?.toString(),\n  vacancyName: negData.vacancy?.name || ''\n};"
+      }
+    },
+    {
+      "id": "c3-check-score",
+      "name": "C3 score ≥ 4?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [200, 960],
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"}, "conditions": [{"id": "cond-score", "leftValue": "={{ $json.score }}", "rightValue": 4, "operator": {"type": "number", "operation": "gte"}}], "combinator": "and"}, "options": {}}
+    },
+    {
+      "id": "c4-send-rejection",
+      "name": "C4 Отправить вежливый отказ",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [340, 1160],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hh.ru/negotiations/{{ $json.nid }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}]},
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "options": {},
+        "bodyParameters": {"parameters": [{"name": "message", "value": "={{ $json.rejectionText }}"}]}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "c5-set-rejected",
+      "name": "C5 Статус: Отказ",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [340, 1340],
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.hh.ru/negotiations/{{ $('C2b Разобрать ответ Claude').first().json.nid }}",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}, {"name": "Content-Type", "value": "application/x-www-form-urlencoded"}]},
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "body": {"status": "discard"},
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "c6-save-state",
+      "name": "C6 Сохранить в Static Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [60, 1160],
+      "parameters": {"jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.negotiations) staticData.negotiations = {};\n\nconst nid = $json.nid;\nstaticData.negotiations[nid] = {\n  nid,\n  vacancyId: $json.vacancyId,\n  vacancyName: $json.vacancyName,\n  candidateName: $json.candidateName,\n  resumeScore: $json.score,\n  resumeSummary: $json.resumeSummary,\n  state: 'screening',\n  currentQuestion: 1,\n  totalQuestions: 3,\n  questionsAsked: [$json.firstQuestion],\n  answersGiven: []\n};\n\nreturn { nid, firstQuestion: $json.firstQuestion };"}
+    },
+    {
+      "id": "c7-send-question",
+      "name": "C7 Отправить первый вопрос",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [60, 1340],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hh.ru/negotiations/{{ $json.nid }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "contentType": "json",
+        "body": {"text": "=Здравствуйте! Спасибо за отклик. Мы изучили ваше резюме и хотели бы уточнить несколько деталей.\n\n{{ $json.firstQuestion }}"},
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "c8-set-in-review",
+      "name": "C8 Статус: В рассмотрении",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [60, 1520],
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.hh.ru/negotiations/{{ $('C6 Сохранить в Static Data').first().json.nid }}",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}, {"name": "Content-Type", "value": "application/x-www-form-urlencoded"}]},
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "body": {"status": "working"},
+        "options": {}
+      }
+    },
+    {
+      "id": "d1-load-context",
+      "name": "D1 Загрузить контекст",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [620, 480],
+      "parameters": {"jsCode": "const staticData = $getWorkflowStaticData('global');\nconst nid = $json.body?.object?.id?.toString();\nconst messageText = $json.body?.message?.text || '';\n\nconst state = staticData.negotiations?.[nid] || null;\n\nif (!state) {\n  return { error: 'Negotiation not found in static data', nid };\n}\n\nreturn {\n  nid,\n  messageText,\n  candidateName: state.candidateName,\n  vacancyId: state.vacancyId,\n  vacancyName: state.vacancyName,\n  resumeScore: state.resumeScore,\n  currentQuestion: state.currentQuestion,\n  totalQuestions: state.totalQuestions,\n  questionsAsked: state.questionsAsked,\n  answersGiven: state.answersGiven,\n  isLastQuestion: state.currentQuestion >= state.totalQuestions\n};"}
+    },
+    {
+      "id": "d1b-save-answer",
+      "name": "D1b Сохранить ответ",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [620, 640],
+      "parameters": {"jsCode": "const staticData = $getWorkflowStaticData('global');\nconst nid = $json.nid;\n\nif (staticData.negotiations?.[nid]) {\n  staticData.negotiations[nid].answersGiven.push($json.messageText);\n}\n\nreturn $json;"}
+    },
+    {
+      "id": "d2-last-question-if",
+      "name": "D2 Последний вопрос?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [620, 800],
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"}, "conditions": [{"id": "cond-last-q", "leftValue": "={{ $json.isLastQuestion }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}}
+    },
+    {
+      "id": "d3-next-question",
+      "name": "D3 Следующий вопрос (Claude)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [760, 1000],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "x-api-key", "value": "YOUR_ANTHROPIC_KEY"}, {"name": "anthropic-version", "value": "2023-06-01"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "options": {},
+        "specifyBody": "json",
+        "jsonBody": "{\"model\": \"claude-haiku-4-5\", \"max_tokens\": 1024, \"system\": \"Ты HR-ассистент, ведёшь квалификационный диалог с кандидатом. Верни JSON: {\\\"next_question\\\": \\\"текст следующего вопроса\\\"}. Только JSON, без markdown.\", \"messages\": [{\"role\": \"user\", \"content\": \"Вакансия: {{ $json.vacancyName }}\\nКандидат: {{ $json.candidateName }}\\n\\nДиалог:\\n{{ $json.questionsAsked.map((q, i) => 'В: ' + q + '\\\\nО: ' + ($json.answersGiven[i] || '...')).join('\\\\n\\\\n') }}\\n\\nПоследний ответ: {{ $json.messageText }}\\nВопрос {{ $json.currentQuestion }} из {{ $json.totalQuestions }}. Задай вопрос {{ $json.currentQuestion + 1 }}.\"}]}"
+      }
+    },
+    {
+      "id": "d3b-save-next-q",
+      "name": "D3b Сохранить вопрос",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [760, 1160],
+      "parameters": {"jsCode": "const staticData = $getWorkflowStaticData('global');\nconst raw = $input.item.json.content[0].text;\nconst parsed = JSON.parse(raw);\nconst ctx = $('D1 Загрузить контекст').first().json;\nconst nid = ctx.nid;\n\nif (staticData.negotiations?.[nid]) {\n  staticData.negotiations[nid].questionsAsked.push(parsed.next_question);\n  staticData.negotiations[nid].currentQuestion++;\n}\n\nreturn { nid, nextQuestion: parsed.next_question };"}
+    },
+    {
+      "id": "d4-send-next-q",
+      "name": "D4 Отправить следующий вопрос",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [760, 1340],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hh.ru/negotiations/{{ $json.nid }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "contentType": "json",
+        "body": {"text": "={{ $json.nextQuestion }}"},
+        "options": {}
+      }
+    },
+    {
+      "id": "d5-final-eval",
+      "name": "D5 Итоговая оценка (Claude)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [500, 1000],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "x-api-key", "value": "YOUR_ANTHROPIC_KEY"}, {"name": "anthropic-version", "value": "2023-06-01"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "options": {},
+        "specifyBody": "json",
+        "jsonBody": "{\"model\": \"claude-haiku-4-5\", \"max_tokens\": 1024, \"system\": \"Ты HR-ассистент. Верни JSON: {\\\"final_score\\\": number (1-10), \\\"recommendation\\\": \\\"hire\\\"|\\\"reject\\\", \\\"summary\\\": \\\"краткое резюме (2-3 предложения)\\\", \\\"hh_status\\\": \\\"approved\\\"|\\\"discard\\\"}. Только JSON, без markdown.\", \"messages\": [{\"role\": \"user\", \"content\": \"Вакансия: {{ $json.vacancyName }}\\nКандидат: {{ $json.candidateName }}\\nПервичный скор: {{ $json.resumeScore }}/10\\n\\nВопросы и ответы:\\n{{ $json.questionsAsked.map((q, i) => 'Вопрос ' + (i+1) + ': ' + q + '\\\\nОтвет: ' + ($json.answersGiven[i] || 'нет ответа')).join('\\\\n\\\\n') }}\"}]}"
+      }
+    },
+    {
+      "id": "d5b-parse-eval",
+      "name": "D5b Разобрать итоговую оценку",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 1160],
+      "parameters": {"jsCode": "const inp = $input.item.json;\nconst rawText = Array.isArray(inp.content) ? inp.content[0].text : JSON.stringify(inp);\nlet raw = rawText.trim();\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch(e1) {\n  const m = raw.match(/```(?:json)?\\s*([\\s\\S]*?)\\s*```/);\n  if (m) {\n    try { parsed = JSON.parse(m[1].trim()); }\n    catch(e2) { throw new Error('Claude block not JSON: ' + m[1].substring(0,150)); }\n  } else {\n    const s = raw.indexOf('{'); const e = raw.lastIndexOf('}');\n    if (s !== -1 && e > s) {\n      try { parsed = JSON.parse(raw.substring(s, e+1)); }\n      catch(e3) { throw new Error('No valid JSON in Claude response: ' + raw.substring(0,150)); }\n    } else {\n      throw new Error('No JSON object in Claude response: ' + raw.substring(0,150));\n    }\n  }\n}\nconst ctx = $('D1 Загрузить контекст').first().json;\nreturn {\n  nid: ctx.nid,\n  candidateName: ctx.candidateName,\n  vacancyName: ctx.vacancyName,\n  finalScore: parsed.final_score,\n  recommendation: parsed.recommendation,\n  summary: parsed.summary,\n  hhStatus: parsed.hh_status\n};"}
+    },
+    {
+      "id": "d6-final-status",
+      "name": "D6 Финальный статус HH",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [500, 1340],
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.hh.ru/negotiations/{{ $json.nid }}",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}, {"name": "Content-Type", "value": "application/x-www-form-urlencoded"}]},
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "body": {"status": "={{ $json.hhStatus }}"},
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "d7-bitrix-lead",
+      "name": "D7 Обновить сделку Битрикс24",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [500, 1520],
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_BITRIX24_DOMAIN/rest/1/YOUR_WEBHOOK/crm.deal.list.json",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {"filter": {"CATEGORY_ID": "97", "%TITLE": "={{ $('D5b Разобрать итоговую оценку').first().json.candidateName }}"}, "select": ["ID", "TITLE", "STAGE_ID"], "order": {"DATE_CREATE": "DESC"}, "limit": 1},
+        "options": {}
+      }
+    },
+    {
+      "id": "d7b-bitrix-update",
+      "name": "D7b Обновить стадию и комментарий",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [700, 1520],
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_BITRIX24_DOMAIN/rest/1/YOUR_WEBHOOK/batch.json",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "halt": 0,
+          "cmd": {
+            "update_stage": "=crm.deal.update?id={{ $json.result[0].ID }}&fields[STAGE_ID]={{ $('D5b Разобрать итоговую оценку').first().json.recommendation === 'hire' ? 'C97:UC_VBRG4F' : 'C97:3' }}&fields[COMMENTS]=AI скрининг: {{ $('D5b Разобрать итоговую оценку').first().json.finalScore }}/10 — {{ $('D5b Разобрать итоговую оценку').first().json.summary }}",
+            "add_comment": "=crm.timeline.comment.add?fields[ENTITY_ID]={{ $json.result[0].ID }}&fields[ENTITY_TYPE]=deal&fields[COMMENT]=🤖 AI-скрининг завершён%0AОценка: {{ $('D5b Разобрать итоговую оценку').first().json.finalScore }}/10%0AРекомендация: {{ $('D5b Разобрать итоговую оценку').first().json.recommendation === 'hire' ? '✅ Пригласить' : '❌ Не подходит' }}%0A%0A{{ $('D5b Разобрать итоговую оценку').first().json.summary }}"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d8-notify-employer",
+      "name": "D8 Уведомить заказчика",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [500, 1700],
+      "credentials": {"telegramApi": {"id": "telegram-bot-cred", "name": "Telegram Bot"}},
+      "parameters": {"resource": "message", "operation": "sendMessage", "chatId": "YOUR_TELEGRAM_CHAT_ID", "text": "=👤 *Кандидат проверен*\n\n*Имя:* {{ $('D5b Разобрать итоговую оценку').first().json.candidateName }}\n*Вакансия:* {{ $('D5b Разобрать итоговую оценку').first().json.vacancyName }}\n*Итоговый скор:* {{ $('D5b Разобрать итоговую оценку').first().json.finalScore }}/10\n*Решение:* {{ $('D5b Разобрать итоговую оценку').first().json.recommendation === 'hire' ? '✅ Рекомендован' : '❌ Отказ' }}\n\n{{ $('D5b Разобрать итоговую оценку').first().json.summary }}", "additionalFields": {"parse_mode": "Markdown"}}
+    },
+    {
+      "id": "d9-clear-state",
+      "name": "D9 Очистить состояние",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 1880],
+      "parameters": {"jsCode": "const staticData = $getWorkflowStaticData('global');\nconst nid = $('D1 Загрузить контекст').first().json.nid;\n\nif (nid && staticData.negotiations) {\n  delete staticData.negotiations[nid];\n}\n\nreturn { cleared: true, nid };"}
+    },
+    {
+      "id": "e1-get-vacancies",
+      "name": "E1 Активные вакансии HH",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1400, 280],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.hh.ru/vacancies/mine?status=published",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}]},
+        "options": {}
+      }
+    },
+    {
+      "id": "e2-get-negotiations",
+      "name": "E2 Отклики за 24ч",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1400, 480],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.hh.ru/negotiations?status=response&order_by=updated_at&per_page=50",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)"}, {"name": "Authorization", "value": "Bearer YOUR_HH_TOKEN"}]},
+        "options": {}
+      }
+    },
+    {
+      "id": "e3-find-unprocessed",
+      "name": "E3 Найти необработанные",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1400, 680],
+      "parameters": {"jsCode": "const staticData = $getWorkflowStaticData('global');\nconst negotiations = $('E2 Отклики за 24ч').first().json?.items || [];\nconst processedIds = new Set(Object.keys(staticData.negotiations || {}));\n\nconst cutoff = Date.now() - 24 * 60 * 60 * 1000;\n\nconst unprocessed = negotiations.filter(n => {\n  const updatedAt = new Date(n.updated_at).getTime();\n  return !processedIds.has(n.id?.toString()) && n.state?.id === 'response' && updatedAt > cutoff;\n});\n\nreturn { unprocessedCount: unprocessed.length, processedCount: processedIds.size, totalActive: negotiations.length, unprocessed };"}
+    },
+    {
+      "id": "e5-telegram-report",
+      "name": "E5 Отчёт в Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1400, 1080],
+      "credentials": {"telegramApi": {"id": "telegram-bot-cred", "name": "Telegram Bot"}},
+      "parameters": {"resource": "message", "operation": "sendMessage", "chatId": "YOUR_TELEGRAM_CHAT_ID", "text": "=🌙 *Ночной отчёт ИИ-HR*\n\nОбработано откликов: {{ $('E3 Найти необработанные').first().json.processedCount }}\n⚠️ Необработанных: {{ $('E3 Найти необработанные').first().json.unprocessedCount }}", "additionalFields": {"parse_mode": "Markdown"}}
+    },
+    {
+      "id": "a1-load-brief",
+      "name": "A1 Загрузить бриф",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 480],
+      "parameters": {"jsCode": "const staticData = $getWorkflowStaticData('global');\nconst chatId = $json.message?.chat?.id?.toString();\nconst text = $json.message?.text || '';\n\nif (!staticData.briefs) staticData.briefs = {};\n\nlet state = staticData.briefs[chatId];\n\nif (!state || state.step === 'done') {\n  state = { step: 'init', chatId, originalRequest: text, answers: [], currentQuestion: 0, totalQuestions: 4 };\n} else {\n  state.answers.push(text);\n  state.currentQuestion++;\n}\n\nstaticData.briefs[chatId] = state;\n\nreturn { chatId, step: state.step, originalRequest: state.originalRequest, currentQuestion: state.currentQuestion, totalQuestions: state.totalQuestions, answers: state.answers, allAnswered: state.currentQuestion >= state.totalQuestions };"}
+    },
+    {
+      "id": "a5-check-complete",
+      "name": "A5 Все ответы получены?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 1120],
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"}, "conditions": [{"id": "cond-all-answered", "leftValue": "={{ $('A1 Загрузить бриф').first().json.allAnswered }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}], "combinator": "and"}, "options": {}}
+    },
+    {
+      "id": "b1-approve-or-edit",
+      "name": "B1 Одобрить или изменить?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1160, 480],
+      "parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "loose"}, "conditions": [{"id": "cond-approve", "leftValue": "={{ $json.callback_query.data }}", "rightValue": "approve", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "options": {}}
+    }
+  ],
+  "connections": {
+    "🔔 HH.RU Webhook": {"main": [[{"node": "🛡️ Только тестовая вакансия", "type": "main", "index": 0}]]},
+    "🤖 Telegram Trigger": {"main": [[{"node": "📍 Telegram Тип", "type": "main", "index": 0}]]},
+    "⏰ Ночной прогон 23:00": {"main": [[{"node": "E1 Активные вакансии HH", "type": "main", "index": 0}]]},
+    "🛡️ Только тестовая вакансия": {"main": [[{"node": "📍 HH Тип события", "type": "main", "index": 0}], []]},
+    "📍 HH Тип события": {"main": [[{"node": "C1 Получить данные отклика", "type": "main", "index": 0}], [{"node": "D1 Загрузить контекст", "type": "main", "index": 0}]]},
+    "📍 Telegram Тип": {"main": [[{"node": "B1 Одобрить или изменить?", "type": "main", "index": 0}], [{"node": "A1 Загрузить бриф", "type": "main", "index": 0}]]},
+    "C1 Получить данные отклика": {"main": [[{"node": "C2 Оценить резюме (Claude)", "type": "main", "index": 0}]]},
+    "C2 Оценить резюме (Claude)": {"main": [[{"node": "C2b Разобрать ответ Claude", "type": "main", "index": 0}]]},
+    "C2b Разобрать ответ Claude": {"main": [[{"node": "C3 score ≥ 4?", "type": "main", "index": 0}]]},
+    "C3 score ≥ 4?": {"main": [[{"node": "C6 Сохранить в Static Data", "type": "main", "index": 0}], [{"node": "C4 Отправить вежливый отказ", "type": "main", "index": 0}]]},
+    "C4 Отправить вежливый отказ": {"main": [[{"node": "C5 Статус: Отказ", "type": "main", "index": 0}]]},
+    "C6 Сохранить в Static Data": {"main": [[{"node": "C7 Отправить первый вопрос", "type": "main", "index": 0}]]},
+    "C7 Отправить первый вопрос": {"main": [[{"node": "C8 Статус: В рассмотрении", "type": "main", "index": 0}]]},
+    "D1 Загрузить контекст": {"main": [[{"node": "D1b Сохранить ответ", "type": "main", "index": 0}]]},
+    "D1b Сохранить ответ": {"main": [[{"node": "D2 Последний вопрос?", "type": "main", "index": 0}]]},
+    "D2 Последний вопрос?": {"main": [[{"node": "D5 Итоговая оценка (Claude)", "type": "main", "index": 0}], [{"node": "D3 Следующий вопрос (Claude)", "type": "main", "index": 0}]]},
+    "D3 Следующий вопрос (Claude)": {"main": [[{"node": "D3b Сохранить вопрос", "type": "main", "index": 0}]]},
+    "D3b Сохранить вопрос": {"main": [[{"node": "D4 Отправить следующий вопрос", "type": "main", "index": 0}]]},
+    "D5 Итоговая оценка (Claude)": {"main": [[{"node": "D5b Разобрать итоговую оценку", "type": "main", "index": 0}]]},
+    "D5b Разобрать итоговую оценку": {"main": [[{"node": "D6 Финальный статус HH", "type": "main", "index": 0}]]},
+    "D6 Финальный статус HH": {"main": [[{"node": "D7 Обновить сделку Битрикс24", "type": "main", "index": 0}]]},
+    "D7 Обновить сделку Битрикс24": {"main": [[{"node": "D7b Обновить стадию и комментарий", "type": "main", "index": 0}]]},
+    "D7b Обновить стадию и комментарий": {"main": [[{"node": "D8 Уведомить заказчика", "type": "main", "index": 0}]]},
+    "D8 Уведомить заказчика": {"main": [[{"node": "D9 Очистить состояние", "type": "main", "index": 0}]]},
+    "A1 Загрузить бриф": {"main": [[{"node": "A5 Все ответы получены?", "type": "main", "index": 0}]]},
+    "E1 Активные вакансии HH": {"main": [[{"node": "E2 Отклики за 24ч", "type": "main", "index": 0}]]},
+    "E2 Отклики за 24ч": {"main": [[{"node": "E3 Найти необработанные", "type": "main", "index": 0}]]},
+    "E3 Найти необработанные": {"main": [[{"node": "E5 Отчёт в Telegram", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1", "saveManualExecutions": true, "callerPolicy": "workflowsFromSameOwner", "errorWorkflow": ""},
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1.0.0",
+  "meta": {"templateCredsSetupCompleted": false, "instanceId": ""}
+}

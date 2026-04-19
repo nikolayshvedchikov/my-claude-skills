@@ -1,0 +1,126 @@
+{
+  "name": "HH.RU Poller — Новые отклики",
+  "_readme": "Replace YOUR_HH_TOKEN with a valid HH.RU employer user token, YOUR_EMPLOYER_ID with your employer ID, and YOUR_N8N_WEBHOOK_URL with your n8n webhook URL.",
+  "nodes": [
+    {
+      "id": "poll-trigger",
+      "name": "⏰ Каждые 5 минут",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [-800, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 5 }]
+        }
+      }
+    },
+    {
+      "id": "poll-get-vacancies",
+      "name": "📋 Получить вакансии работодателя",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [-600, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.hh.ru/employers/YOUR_EMPLOYER_ID/vacancies",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)" },
+            { "name": "Authorization", "value": "Bearer YOUR_HH_TOKEN" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "per_page", "value": "100" },
+            { "name": "page", "value": "0" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "poll-extract-ids",
+      "name": "🔢 Извлечь ID вакансий",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-400, 300],
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst vacancies = data.items || [];\n// Return one item per vacancy with its ID\nif (vacancies.length === 0) {\n  return [{ vacancy_id: 'YOUR_TEST_VACANCY_ID' }]; // fallback: test vacancy\n}\nreturn vacancies.map(v => ({ vacancy_id: String(v.id), vacancy_name: v.name || '' }));"
+      }
+    },
+    {
+      "id": "poll-get-negotiations",
+      "name": "📥 Отклики по вакансии",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [-200, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.hh.ru/negotiations?vacancy_id={{ $json.vacancy_id }}&order_by=updated_at&order=desc&per_page=50&page=0",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)" },
+            { "name": "Authorization", "value": "Bearer YOUR_HH_TOKEN" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "poll-filter-new",
+      "name": "🔍 Только новые отклики",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "parameters": {
+        "jsCode": "const data = $input.item.json;\nconst items = data.items || [];\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.lastProcessedMap) staticData.lastProcessedMap = {};\n\nconst vacId = items.length > 0 ? String(items[0].vacancy?.id || '') : '';\nconst lastTs = staticData.lastProcessedMap[vacId] || '2020-01-01T00:00:00+0000';\n\n// Filter: only state=response and updated after last poll\nconst newNeg = items.filter(n => {\n  const state = n.state?.id;\n  return n.updated_at > lastTs && (state === 'response' || state === 'invitation');\n});\n\n// Save latest timestamp for this vacancy\nif (items.length > 0 && vacId) {\n  staticData.lastProcessedMap[vacId] = items[0].updated_at;\n}\n\n// On very first run per vacancy: don't process, just record timestamp\nif (!staticData.lastProcessedMap[vacId] && items.length > 0 && vacId) {\n  staticData.lastProcessedMap[vacId] = items[0].updated_at;\n  return [];\n}\n\nreturn newNeg.map(n => ({\n  nid: String(n.id),\n  vacancy_id: String(n.vacancy?.id || vacId)\n}));"
+      }
+    },
+    {
+      "id": "poll-trigger-main",
+      "name": "🚀 Запустить основной workflow",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [200, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_N8N_WEBHOOK_URL",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"type\": \"NEW_RESPONSE_OR_INVITATION_VACANCY\", \"object\": {\"id\": \"{{ $json.nid }}\", \"vacancy_id\": \"{{ $json.vacancy_id }}\"}}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "⏰ Каждые 5 минут": {
+      "main": [[{ "node": "📋 Получить вакансии работодателя", "type": "main", "index": 0 }]]
+    },
+    "📋 Получить вакансии работодателя": {
+      "main": [[{ "node": "🔢 Извлечь ID вакансий", "type": "main", "index": 0 }]]
+    },
+    "🔢 Извлечь ID вакансий": {
+      "main": [[{ "node": "📥 Отклики по вакансии", "type": "main", "index": 0 }]]
+    },
+    "📥 Отклики по вакансии": {
+      "main": [[{ "node": "🔍 Только новые отклики", "type": "main", "index": 0 }]]
+    },
+    "🔍 Только новые отклики": {
+      "main": [[{ "node": "🚀 Запустить основной workflow", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1.0.0",
+  "meta": { "instanceId": "poller-hh-v2" }
+}
