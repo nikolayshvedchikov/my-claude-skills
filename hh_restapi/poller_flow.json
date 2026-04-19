@@ -1,6 +1,6 @@
 {
   "name": "HH.RU Poller — Новые отклики",
-  "_readme": "Replace YOUR_HH_TOKEN with a valid HH.RU employer user token, YOUR_EMPLOYER_ID with your employer ID, and YOUR_N8N_WEBHOOK_URL with your n8n webhook URL.",
+  "_readme": "Replace YOUR_HH_TOKEN, YOUR_EMPLOYER_ID, YOUR_TEST_VACANCY_ID, YOUR_N8N_WEBHOOK_URL. After importing and patching, always deactivate + reactivate to flush n8n schedule cache.",
   "nodes": [
     {
       "id": "poll-trigger",
@@ -20,6 +20,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
       "position": [-600, 300],
+      "onError": "continueRegularOutput",
       "parameters": {
         "method": "GET",
         "url": "https://api.hh.ru/employers/YOUR_EMPLOYER_ID/vacancies",
@@ -47,7 +48,7 @@
       "typeVersion": 2,
       "position": [-400, 300],
       "parameters": {
-        "jsCode": "const data = $input.first().json;\nconst vacancies = data.items || [];\n// Return one item per vacancy with its ID\nif (vacancies.length === 0) {\n  return [{ vacancy_id: 'YOUR_TEST_VACANCY_ID' }]; // fallback: test vacancy\n}\nreturn vacancies.map(v => ({ vacancy_id: String(v.id), vacancy_name: v.name || '' }));"
+        "jsCode": "const data = $input.first().json;\nconst vacancies = data.items || [];\n// Fallback to test vacancy if API returns nothing\nif (vacancies.length === 0) {\n  return [{ vacancy_id: 'YOUR_TEST_VACANCY_ID' }];\n}\nreturn vacancies.map(v => ({ vacancy_id: String(v.id), vacancy_name: v.name || '' }));"
       }
     },
     {
@@ -56,10 +57,12 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
       "position": [-200, 300],
+      "onError": "continueRegularOutput",
       "parameters": {
         "method": "GET",
-        "url": "=https://api.hh.ru/negotiations?vacancy_id={{ $json.vacancy_id }}&order_by=updated_at&order=desc&per_page=50&page=0",
+        "url": "https://api.hh.ru/negotiations/response?vacancy_id={{ $json.vacancy_id }}&per_page=50&page=0",
         "sendHeaders": true,
+        "specifyHeaders": "keypair",
         "headerParameters": {
           "parameters": [
             { "name": "HH-User-Agent", "value": "HH-HR-Assistant/1.0 (your@email.com)" },
@@ -76,7 +79,7 @@
       "typeVersion": 2,
       "position": [0, 300],
       "parameters": {
-        "jsCode": "const data = $input.item.json;\nconst items = data.items || [];\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.lastProcessedMap) staticData.lastProcessedMap = {};\n\nconst vacId = items.length > 0 ? String(items[0].vacancy?.id || '') : '';\nconst lastTs = staticData.lastProcessedMap[vacId] || '2020-01-01T00:00:00+0000';\n\n// Filter: only state=response and updated after last poll\nconst newNeg = items.filter(n => {\n  const state = n.state?.id;\n  return n.updated_at > lastTs && (state === 'response' || state === 'invitation');\n});\n\n// Save latest timestamp for this vacancy\nif (items.length > 0 && vacId) {\n  staticData.lastProcessedMap[vacId] = items[0].updated_at;\n}\n\n// On very first run per vacancy: don't process, just record timestamp\nif (!staticData.lastProcessedMap[vacId] && items.length > 0 && vacId) {\n  staticData.lastProcessedMap[vacId] = items[0].updated_at;\n  return [];\n}\n\nreturn newNeg.map(n => ({\n  nid: String(n.id),\n  vacancy_id: String(n.vacancy?.id || vacId)\n}));"
+        "jsCode": "const data = $input.item.json;\nconst items = data.items || [];\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.lastProcessedMap) staticData.lastProcessedMap = {};\n\nconst vacId = items.length > 0 ? String(items[0].vacancy?.id || '') : '';\nconst lastTs = staticData.lastProcessedMap[vacId] || '2020-01-01T00:00:00+0000';\n\n// Filter: only state=response/invitation and updated after last poll\nconst newNeg = items.filter(n => {\n  const state = n.state?.id;\n  return n.updated_at > lastTs && (state === 'response' || state === 'invitation');\n});\n\n// Save latest timestamp for this vacancy\nif (items.length > 0 && vacId) {\n  staticData.lastProcessedMap[vacId] = items[0].updated_at;\n}\n\n// On very first run per vacancy: record timestamp, don't process old items\nif (!staticData.lastProcessedMap[vacId] && items.length > 0 && vacId) {\n  staticData.lastProcessedMap[vacId] = items[0].updated_at;\n  return [];\n}\n\nreturn newNeg.map(n => ({\n  nid: String(n.id),\n  vacancy_id: String(n.vacancy?.id || vacId)\n}));"
       }
     },
     {
@@ -88,15 +91,9 @@
       "parameters": {
         "method": "POST",
         "url": "YOUR_N8N_WEBHOOK_URL",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            { "name": "Content-Type", "value": "application/json" }
-          ]
-        },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"type\": \"NEW_RESPONSE_OR_INVITATION_VACANCY\", \"object\": {\"id\": \"{{ $json.nid }}\", \"vacancy_id\": \"{{ $json.vacancy_id }}\"}}",
+        "jsonBody": "{\"type\": \"NEW_RESPONSE_OR_INVITATION_VACANCY\", \"object\": {\"id\": \"{{ $json.nid }}\"}, \"vacancy_id\": \"{{ $json.vacancy_id }}\"}",
         "options": {}
       }
     }
@@ -120,7 +117,5 @@
   },
   "settings": { "executionOrder": "v1" },
   "staticData": null,
-  "pinData": {},
-  "versionId": "1.0.0",
-  "meta": { "instanceId": "poller-hh-v2" }
+  "pinData": {}
 }
