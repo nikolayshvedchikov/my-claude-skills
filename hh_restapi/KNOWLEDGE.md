@@ -1,6 +1,6 @@
 # KNOWLEDGE.md — HH.RU HR Ассистент: журнал отладки и реализации
 
-> Последнее обновление: 2026-04-19. Читай этот файл перед началом работы.
+> Последнее обновление: 2026-04-19 (сессия 2, ~22:00 MSK). Читай этот файл перед началом работы.
 
 ---
 
@@ -18,8 +18,8 @@ n8n: HH.RU HR Ассистент (ID: 4LXW8oTh168CnTqy)
 [E-цепочка] Ночной прогон 23:00 → статистика + GitHub backup
 
 n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
-  → GET /employers/3565638/vacancies
-  → GET /negotiations/response?vacancy_id=...
+  → GET /employers/{employer_id}/vacancies (fallback: hardcoded vacancy)
+  → GET /negotiations/response?vacancy_id=...&per_page=50&page=0
   → POST webhook/hh-events если нашёл новые
 ```
 
@@ -48,21 +48,25 @@ n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
 - Новый n8n (>1.x) возвращает cookie `n8n-auth`, НЕ токен в теле
 - Для запросов: `-b "n8n-auth=<cookie>"`
 - Обновление workflow: `PATCH /rest/workflows/{id}` (не PUT!)
-- Перед PATCH не нужно вручную обновлять versionId — n8n сам управляет
+- Деактивация: `POST /rest/workflows/{id}/deactivate`
+- Активация: `POST /rest/workflows/{id}/activate` с телом `{"versionId":"<VID>"}`
+- **ВАЖНО**: после PATCH расписание не перезагружается — нужна деактивация + активация!
 
 ---
 
 ## 4. HH.RU API — критические баги и факты
 
-### ГЛАВНЫЙ БАГ (исправлен 2026-04-19):
-`GET /negotiations?vacancy_id=...` — возвращает коллекцию БЕЗ `items[]`.  
-**Правильный endpoint:** `GET /negotiations/response?vacancy_id=...&order_by=updated_at&per_page=50&page=0`
+### ГЛАВНЫЕ БАГИ (оба исправлены):
+1. `GET /negotiations?vacancy_id=...` — возвращает коллекцию БЕЗ `items[]`.  
+   **Правильный endpoint:** `GET /negotiations/response?vacancy_id=...&per_page=50&page=0`
+2. `order_by=updated_at` — **BAD_ARGUMENT** для `/negotiations/response`!  
+   Этот параметр просто не поддерживается. Убери его. Работает без него.
 
 ### Остальные факты:
 - `/negotiations/response` требует обязательный параметр `vacancy_id`
 - `/me` для работодателя: поле `employer.id` = 3565638, `employer.manager_id` = 4424964
 - `/vacancies?mine=true` — возвращает НЕ вакансии работодателя (это вакансии менеджера/кандидата!)
-- `/employers/3565638/vacancies/active` — у текущего аккаунта 0 активных вакансий
+- `/employers/3565638/vacancies` — возвращает 0 активных вакансий (404 not_found или пустой список)
 - Для получения вакансий работодателя: `/vacancies?manager_id={manager_id}` — НО это возвращает 859к чужих вакансий!
 - Тестовая вакансия: `130853744` ("Начинающий специалист по внедрению Битрикс24"), архивная
 - На архивной вакансии: 156 откликов (found: 156)
@@ -99,10 +103,14 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 ### Исправлено в n8n (живой экземпляр):
 1. **Поллер** — URL исправлен: `/negotiations?` → `/negotiations/response?`
-2. **Главный флоу** — для dry-test отключены ноды C4, C5, C7, C8 (сообщения кандидатам)
-3. **Главный флоу** — E2 URL исправлен: `/negotiations?` → `/negotiations/response?`
+2. **Поллер** — убран невалидный параметр `order_by=updated_at` (400 Bad Request)
+3. **Поллер** — убран leading `=` в URL ноды `📥 Отклики по вакансии`
+4. **Поллер** — добавлен `onError: continueRegularOutput` на ноду вакансий (404 не ломает цепочку)
+5. **Поллер** — деактивация + реактивация для перезагрузки кешированного расписания
+6. **Главный флоу** — для dry-test отключены ноды C4, C5, C7, C8 (сообщения кандидатам)
+7. **Главный флоу** — E2 URL исправлен: `/negotiations?` → `/negotiations/response?`
 
-### Результаты dry-test (execution #2294):
+### Результаты dry-test главного флоу (execution #2302):
 - Webhook → Filter → Switch → C1 → C2(Claude) → C2b → C3 → C4(disabled) → C5(disabled)
 - **C1**: успешно получил данные переговоров от HH.RU ✅
 - **C2**: Claude API вызван, резюме Данилковой оценено ✅
@@ -110,24 +118,39 @@ curl -s -X POST -H 'Content-Type: application/json' \
 - **C3**: score < 4 → ветка отказа ✅
 - **C4/C5**: отключены → сообщения НЕ отправлены ✅ (dry run)
 
+### Результаты dry-test поллера (execution #2305):
+- Trigger → Вакансии (404, continueRegularOutput) → Извлечь IDs (fallback: 130853744) → Отклики → Фильтр (0 новых) → стоп
+- **Статус**: success ✅ — все 6 нод прошли
+- **Нет новых откликов**: ожидаемо — staticData.lastProcessedMap[130853744] уже на Данилковой
+
+### ВАЖНО — n8n кеширует расписание:
+После PATCH воркфлоу расписание продолжает выполнять СТАРУЮ версию из памяти.  
+**Решение**: деактивировать → реактивировать:
+```bash
+curl -s -X POST -b "n8n-auth=<COOKIE>" https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/deactivate
+VID=$(curl -s -b "n8n-auth=<COOKIE>" https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['versionId'])")
+curl -s -X POST -b "n8n-auth=<COOKIE>" -H "Content-Type: application/json" -d "{\"versionId\":\"$VID\"}" \
+  https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/activate
+```
+
 ### Что ещё нужно сделать перед боевым запуском:
-1. Убедиться что HH.RU webhook реально шлёт `NEW_RESPONSE_OR_INVITATION_VACANCY` (или обновить condition в Switch)
-2. Поллер: `/employers/3565638/vacancies` возвращает 0 активных вакансий → нужно найти правильный способ получения вакансий работодателя
-3. Поллер должен включать `vacancy_id` в payload при вызове webhook
-4. Включить C4/C5/C7/C8 обратно для боевой работы
-5. Протестировать с Данилковой Антониной в рабочее время (не воскресенье)
-6. Проверить Bitrix24 и Telegram интеграции
+1. Включить C4/C5/C7/C8 обратно (убрать `disabled: true`)
+2. Протестировать отправку сообщения Данилковой в рабочее время (с её согласия)
+3. Убедиться что HH.RU webhook шлёт `NEW_RESPONSE_OR_INVITATION_VACANCY`
+4. Решить проблему поллера с активными вакансиями (см. раздел 7)
+5. Проверить Bitrix24 и Telegram интеграции
 
 ---
 
 ## 7. Поллер — проблема с вакансиями работодателя
 
-Поллер использует `GET /employers/3565638/vacancies` — но возвращает 0 активных вакансий.
+Поллер использует `GET /employers/3565638/vacancies` — но возвращает 0 активных вакансий.  
+Код-нода `🔢 Извлечь ID вакансий` автоматически использует fallback: `vacancy_id = '130853744'`.
 
-Варианты решения:
-- Жёстко задать список вакансий в Static Data поллера
+Варианты долгосрочного решения:
+- Жёстко задать список активных вакансий в Static Data поллера
 - Использовать другой endpoint для получения вакансий менеджера
-- Зарегистрировать настоящий HH.RU webhook (не поллинг)
+- Зарегистрировать настоящий HH.RU webhook (не поллинг) — тогда поллер не нужен вообще
 
 ---
 
@@ -140,19 +163,31 @@ curl -s -c /tmp/n8n_cookie.txt \
   -H "Content-Type: application/json" \
   -d '{"emailOrLdapLoginId":"6617911@mail.ru","password":"zFP&T1Ok"}' > /dev/null
 
+COOKIE=$(grep 'n8n-auth' /tmp/n8n_cookie.txt | awk '{print $NF}')
+
 # Получить список воркфлоу
-curl -s -b /tmp/n8n_cookie.txt \
-  https://oburscuforring.beget.app/rest/workflows \
-  | python3 -c "import sys,json; ws=json.load(sys.stdin); [print(w.get('id'), w.get('name','')) for w in ws.get('data',[])]"
+curl -s -b "n8n-auth=$COOKIE" https://oburscuforring.beget.app/rest/workflows \
+  | python3 -c "import sys,json; [print(w['id'], w['name']) for w in json.load(sys.stdin)['data']]"
 
 # Получить воркфлоу
-curl -s -b "n8n-auth=<COOKIE>" https://oburscuforring.beget.app/rest/workflows/4LXW8oTh168CnTqy
+curl -s -b "n8n-auth=$COOKIE" https://oburscuforring.beget.app/rest/workflows/4LXW8oTh168CnTqy
 
-# Обновить воркфлоу
-curl -s -X PATCH -b "n8n-auth=<COOKIE>" \
+# Обновить воркфлоу (PATCH)
+curl -s -X PATCH -b "n8n-auth=$COOKIE" \
   -H "Content-Type: application/json" \
   -d '<FULL_WORKFLOW_JSON>' \
   https://oburscuforring.beget.app/rest/workflows/4LXW8oTh168CnTqy
+
+# Деактивировать воркфлоу
+curl -s -X POST -b "n8n-auth=$COOKIE" \
+  https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/deactivate
+
+# Активировать воркфлоу (нужен versionId)
+VID=$(curl -s -b "n8n-auth=$COOKIE" https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['versionId'])")
+curl -s -X POST -b "n8n-auth=$COOKIE" -H "Content-Type: application/json" \
+  -d "{\"versionId\":\"$VID\"}" \
+  https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/activate
 ```
 
 ---
@@ -163,7 +198,7 @@ curl -s -X PATCH -b "n8n-auth=<COOKIE>" \
 
 Файлы:
 - `main_flow_ready.json` — главный workflow с плейсхолдерами
-- `poller_flow.json` — поллер workflow с плейсхолдерами
+- `poller_flow.json` — поллер workflow (6-нодовый, с плейсхолдерами)
 - `README.md` — архитектура, тест-план, таблица замены плейсхолдеров
 - `KNOWLEDGE.md` — этот файл
 
@@ -174,8 +209,17 @@ curl -s -X PATCH -b "n8n-auth=<COOKIE>" \
 ## 10. Следующая сессия — с чего начинать
 
 1. Прочитай этот файл
-2. Залогинься в n8n через cookie
-3. Включи C4/C5/C7/C8 обратно (убери `disabled: true`)
-4. Реши проблему поллера с вакансиями
-5. Убедись что HH.RU webhook тип совпадает со switch condition
-6. Протестируй с Данилковой в рабочее время
+2. Залогинься в n8n через cookie (раздел 8)
+3. Включи C4/C5/C7/C8 обратно: PATCH главного флоу, убери `"disabled": true` у этих нод
+4. После PATCH — деактивируй и реактивируй главный флоу (раздел 6, блок n8n кеш)
+5. Реши проблему поллера с активными вакансиями: либо хардкод вакансий в staticData, либо HH.RU webhook
+6. Протестируй с Данилковой в рабочее время (попроси её ответить на новое тестовое сообщение)
+7. Проверь что HH.RU webhook шлёт правильный тип события
+
+### Текущее состояние системы (конец сессии 2):
+- ✅ Поллер: работает (execution 2305 — success, все 6 нод)
+- ✅ Главный флоу: работает в dry-mode (C4/C5/C7/C8 отключены)
+- ✅ Claude оценивает резюме корректно
+- ✅ staticData поллера: lastProcessedMap[130853744] = 2026-04-16T09:32:06+0300
+- ⏸️ Отправка кандидатам: отключена (dry mode)
+- ❓ Активные вакансии HH.RU: не найдены через API, поллер использует fallback 130853744
