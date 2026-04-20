@@ -1,6 +1,6 @@
 # KNOWLEDGE.md — HH.RU HR Ассистент: журнал отладки и реализации
 
-> Последнее обновление: 2026-04-20 (сессия 4, утро). Читай этот файл перед началом работы.
+> Последнее обновление: 2026-04-20 (сессия 5). Читай этот файл перед началом работы.
 
 ---
 
@@ -13,14 +13,17 @@ n8n: HH.RU HR Ассистент (ID: 4LXW8oTh168CnTqy)
         ↓
 [C-цепочка] Новый отклик → Claude оценивает → Accept/Reject → HH.RU
 [D-цепочка] Telegram-ответ кандидата → Claude генерирует вопрос → HH.RU
-[A-цепочка] Telegram-бриф от заказчика → Claude генерирует вакансию
-[B-цепочка] Одобрение вакансии → публикация на HH.RU
 [E-цепочка] Ночной прогон 23:00 → статистика + GitHub backup
+[⏰] Проверка активных вакансий HH.RU — каждый час (7:00–21:00 МСК)
 
 n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
-  → GET /employers/3565638/vacancies
+  → GET /employers/{employer_id}/vacancies
   → GET /negotiations/response?vacancy_id=...
   → POST webhook/hh-events если нашёл новые
+
+УДАЛЕНО (ручное управление заказчиком):
+  A-цепочка: Telegram-бриф → публикация вакансии на HH.RU
+  B-цепочка: Одобрение вакансии
 ```
 
 ---
@@ -31,10 +34,10 @@ n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
 |-----|----------|
 | n8n URL | https://oburscuforring.beget.app |
 | n8n login field | `emailOrLdapLoginId` (НЕ emailOrUsername!) |
-| n8n email | 6617911@mail.ru |
+| n8n email | YOUR_N8N_EMAIL |
 | n8n password | YOUR_N8N_PASSWORD |
-| HH.RU employer ID | 3565638 (Экстраверт) |
-| HH.RU manager ID | 4424964 |
+| HH.RU employer ID | YOUR_EMPLOYER_ID |
+| HH.RU manager ID | YOUR_MANAGER_ID |
 | HH.RU token | YOUR_HH_TOKEN |
 | Webhook path | /webhook/hh-events |
 | Main workflow ID | 4LXW8oTh168CnTqy |
@@ -49,26 +52,33 @@ n8n Поллер (ID: swW1Www0gmme6Yvi) — каждые 5 минут
 - Для запросов: `-b "n8n-auth=<cookie>"`
 - Обновление workflow: `PATCH /rest/workflows/{id}` (не PUT!)
 - Перед PATCH не нужно вручную обновлять versionId — n8n сам управляет
+- executions API: ответ имеет структуру `data.results[]` (НЕ `data.data[]`)
 
 ---
 
 ## 4. HH.RU API — критические баги и факты
 
-### ГЛАВНЫЕ БАГИ (оба исправлены):
+### ГЛАВНЫЕ БАГИ (все исправлены):
 1. `GET /negotiations?vacancy_id=...` — возвращает коллекцию БЕЗ `items[]`.  
    **Правильный endpoint:** `GET /negotiations/response?vacancy_id=...&per_page=50&page=0`
 2. `order_by=updated_at` — **BAD_ARGUMENT** для `/negotiations/response`!  
    Этот параметр просто не поддерживается. Убери его. Работает без него.
+3. **Смена статуса отклика (C5/C8)** — `PUT /negotiations/{nid}` → **405 Method Not Allowed** (это endpoint для кандидатов, не работодателей). `PUT /negotiations/employer_negotiations/{nid}` → **403 wrong_state** (тоже неверно).  
+   **Правильный формат — action-based URL:**
+   ```
+   PUT https://api.hh.ru/negotiations/{action_id}/{nid}
+   ```
+   Список `action_id` берётся из поля `actions[].url` в ответе `GET /negotiations/{nid}`.  
+   Пример: `PUT /negotiations/discard_by_employer/{nid}` — отказ (C5).  
+   Пример: `PUT /negotiations/invitation/{nid}` — пригласить/В рассмотрении (C8).  
+   HH.RU возвращает пустой `{}` или 204 при успехе — это норма.
 
 ### Остальные факты:
 - `/negotiations/response` требует обязательный параметр `vacancy_id`
-- `/me` для работодателя: поле `employer.id` = 3565638, `employer.manager_id` = 4424964
-- `/vacancies?mine=true` — возвращает НЕ вакансии работодателя (это вакансии менеджера/кандидата!)
-- `/employers/3565638/vacancies/active` — у текущего аккаунта 0 активных вакансий
-- Для получения вакансий работодателя: `/vacancies?manager_id={manager_id}` — НО это возвращает 859к чужих вакансий!
+- `/me` для работодателя: поле `employer.id`, `employer.manager_id`
+- `/vacancies?mine=true` — возвращает НЕ вакансии работодателя!
 - Тестовая вакансия: `130853744` ("Начинающий специалист по внедрению Битрикс24"), архивная
-- На архивной вакансии: 156 откликов (found: 156)
-- Тестовый кандидат: Данилкова Антонина, nid=5169546644, state=response
+- Тестовый кандидат: Данилкова Антонина, nid=5169546644, **state=discard_by_employer** (после тестов)
 
 ---
 
@@ -85,46 +95,56 @@ HH.RU шлёт вебхуки в формате:
 **ВАЖНО:** n8n switch проверяет `$json.body.type == "NEW_RESPONSE_OR_INVITATION_VACANCY"`.  
 В тестах нужно слать именно это значение, а не `NEW_NEGOTIATION`.
 
-**ВАЖНО:** Фильтр `🛡️ Только тестовая вакансия` проверяет `$json.body.vacancy_id`.  
+**ВАЖНО:** Фильтр `✅ Фильтр: есть vacancy_id` проверяет `$json.body.vacancy_id != ''`.  
 Поллер и тестовые вызовы ДОЛЖНЫ включать `vacancy_id` в body.
 
 Пример тестового curl:
 ```bash
 curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"type":"NEW_RESPONSE_OR_INVITATION_VACANCY","object":{"id":"5169546644"},"vacancy_id":"130853744"}' \
-  'https://oburscuforring.beget.app/webhook/hh-events'
+  -d '{"type":"NEW_RESPONSE_OR_INVITATION_VACANCY","object":{"id":"NID"},"vacancy_id":"VID"}' \
+  'https://YOUR_N8N_HOST/webhook/hh-events'
 ```
+
+---
+
+## 5в. Сессия 5 (2026-04-20, день): что сделано и проверено
+
+### Исправлено: C5 и C8 — смена статуса HH.RU
+
+**C5 Статус: Отказ** (reject path):
+- Было: `PUT /negotiations/{nid}` + body `status=discard` → 405
+- Стало: `PUT /negotiations/discard_by_employer/{nid}` (без body, sendBody=false)
+- Проверено (execution #2488): C5 вернул `{}` без ошибок ✅
+- Статус кандидата изменён на `discard_by_employer` в HH.RU ✅
+
+**C8 Статус: В рассмотрении** (accept path):
+- Было: `PUT /negotiations/{nid}` + body `status=working` → тоже дало бы 405
+- Стало: `PUT /negotiations/invitation/{nid}` (без body, sendBody=false)
+- Ещё не тестировалось (нет свежего кандидата в state=response)
+
+### Техническая деталь: n8n executions API структура
+
+В новой версии n8n ответ от `GET /rest/executions?filter=...` имеет структуру:
+```
+data.results[]  (НЕ data.data[])
+```
+
+### Текущее состояние системы (конец сессии 5):
+- ✅ C5: исправлен, работает (`PUT /negotiations/discard_by_employer/{nid}`)
+- ✅ C8: исправлен, не тестирован (`PUT /negotiations/invitation/{nid}`)
+- ✅ Main workflow: active=true, versionId `8ac7ed40-8813-412c-9b42-2542c68a0c22`
 
 ---
 
 ## 5б. Сессия 4 (2026-04-20, утро): что сделано и проверено
 
-### Проверено (всё уже было исправлено в конце сессии 3):
-1. **A7 Показать превью вакансии** — имеет `additionalFields.reply_markup` с inline-кнопками:
-   ```json
-   {"inline_keyboard": [[
-     {"text": "✅ Одобрить", "callback_data": "approve"},
-     {"text": "✏️ Изменить", "callback_data": "edit"}
-   ]]}
-   ```
-2. **A6 Сформировать текст вакансии** — использует `claude-sonnet-4-6`, структурированный промпт с HTML-разметкой для HH.RU
-3. **B1 Одобрить или изменить?** — корректно проверяет `$json.callback_query.data === 'approve'`
-4. **📍 Telegram Тип** — роутит: callback_query → B1, plain message → A1
-
 ### Сделано в сессии 4:
-- **Включены C4/C5/C7/C8** — сняты `disabled: true`, воркфлоу в боевом режиме (versionId: a05973fa)
-
-### Архитектура A-цепочки (подтверждена):
-```
-TG Trigger → 📍 Telegram Тип
-  → out[1] (text) → A1 Загрузить бриф (Code, Static Data)
-    → A5 Все ответы получены?
-      → out[0] (да) → A6 Claude (sonnet) → A6b → A7 (preview + кнопки)
-      → out[1] (нет) → A2 Claude (haiku) → A2b → A3 Отправить вопрос
-  → out[0] (callback_query) → B1 approve?
-    → out[0] (approve) → B2 → B3 POST /vacancies → B4 уведомление
-    → out[1] (edit) → B5 Что изменить?
-```
+- **Включены C4/C5/C7/C8** — сняты `disabled: true`, воркфлоу в боевом режиме
+- **Удалены A/B цепочки** — вакансии публикует заказчик вручную
+- **Удалены D7/D7b** — интеграция с Битрикс24 убрана (конфликт сообщений)
+- **Добавлен ⏰ Schedule Trigger** — проверка вакансий HH.RU каждый час (7:00–21:00 МСК)
+- **Обновлён фильтр** — `🛡️ Только тестовая вакансия` → `✅ Фильтр: есть vacancy_id` (проверяет `!== ''`)
+- **Поллер обновлён** — умный кеш 60 мин для списка активных вакансий
 
 ### n8n executions API — правильный запрос:
 Фильтр `?workflowId=` НЕ работает напрямую. Нужно:
@@ -140,122 +160,43 @@ Telegram bot token недоступен через API — получить то
 
 ## 6. Сессия 3 (2026-04-19, ~20:30 MSK): что сделано
 
-### Исправлено в n8n (сессия 3):
-
-**КРИТИЧЕСКИЙ БАГ: jsonBody-выражения не вычислялись**  
-Все узлы Claude (C2, A2, A6) использовали `specifyBody: "json"` с `jsonBody` без префикса `=`. В результате `{{ }}` выражения отправлялись в Claude буквально, и Claude отвечал "Я не вижу данных из переменных шаблона" вместо JSON. Исправление: переключить на `jsonBody` с префиксом `=` (expression mode), который вычисляет `JSON.stringify({...})` с реальными данными.
-
-1. **C2 Оценить резюме (Claude)** — `jsonBody` → expression mode (`={{ JSON.stringify({...}) }}`), модель обновлена до `claude-haiku-4-5-20251001`
-2. **A2 Сгенерировать вопрос (Claude)** — то же исправление
-3. **A6 Сформировать текст вакансии** — то же исправление
-4. **Workflow активация** — воркфлоу был `active=False` (деактивирован в предыдущей сессии и не реактивирован). После активации webhook `/webhook/hh-events` снова вернул 200.
-5. **Telegram Trigger** — UUID исправлен в предыдущей сессии: `id` = `04601f3e-a964-480b-b01d-ad5c2ed4a817`, `webhookId` = `e5fc7db0-9ce1-4d5f-82ed-3c3f564b8a99`. Работает через polling mode (не webhook).
+### КРИТИЧЕСКИЙ БАГ (исправлен): jsonBody-выражения не вычислялись
+Все узлы Claude (C2, A2, A6) использовали `specifyBody: "json"` с `jsonBody` без префикса `=`. В результате `{{ }}` выражения отправлялись в Claude буквально. Исправление: переключить на expression mode (`={{ JSON.stringify({...}) }}`).
 
 ### Результаты тестов (сессия 3):
-
-**C-цепочка (execution #2324) — УСПЕХ:**
-```json
-{
-  "nid": "5169546644",
-  "score": 2,
-  "verdict": "fail",
-  "comment": "Отсутствует информация об опыте работы и навыках...",
-  "rejectionText": "Уважаемая Антонина! Спасибо за интерес к вакансии...",
-  "candidateName": "Данилкова Антонина",
-  "vacancyName": "Начинающий специалист по внедрению Битрикс24"
-}
-```
-- C1 → C2 (Claude) → C2b → C3 → C4(disabled) → C5(disabled) ✅
-- Claude корректно оценивает пустое резюме (score=2, verdict=fail) ✅
+- C-цепочка (execution #2324): score=2, verdict=fail, сообщение об отказе сформировано ✅
+- Claude корректно оценивает пустое резюме ✅
 
 ### ВАЖНО — n8n Telegram Trigger mode:
-`n8n-nodes-base.telegramTrigger` использует **polling mode** (не webhook). Путь `/webhook/{webhookId}` возвращает 404 — это нормально! n8n сам опрашивает Telegram API `getUpdates`. Не пытайся тестировать TG trigger через HTTP-запросы к webhook path.
-
-### Текущее состояние (конец сессии 3):
-- ✅ C-цепочка: полностью работает (C1→C2→C2b→C3, Claude оценивает корректно)
-- ✅ Главный флоу: active=True, webhook 200
-- ✅ A2/A6: исправлены expression mode jsonBody
-- ✅ Telegram Trigger: polling mode, workflow активен
-- ⏸️ C4/C5/C7/C8: отключены (dry mode) — нужно включить перед продакшеном
-- ❓ A-цепочка: настроена, но не протестирована end-to-end (нужен реальный Telegram-бот)
-
----
-
-## 6б. Сессия 2026-04-19 (сессия 2): что было сделано
-
-### Исправлено в n8n (живой экземпляр):
-1. **Поллер** — URL исправлен: `/negotiations?` → `/negotiations/response?`
-2. **Поллер** — убран невалидный параметр `order_by=updated_at` (400 Bad Request)
-3. **Поллер** — убран leading `=` в URL ноды `📥 Отклики по вакансии`
-4. **Поллер** — добавлен `onError: continueRegularOutput` на ноду вакансий (404 не ломает цепочку)
-5. **Поллер** — деактивация + реактивация для перезагрузки кешированного расписания
-6. **Главный флоу** — для dry-test отключены ноды C4, C5, C7, C8 (сообщения кандидатам)
-7. **Главный флоу** — E2 URL исправлен: `/negotiations?` → `/negotiations/response?`
-
-### Результаты dry-test главного флоу (execution #2302):
-- Webhook → Filter → Switch → C1 → C2(Claude) → C2b → C3 → C4(disabled) → C5(disabled)
-- **C1**: успешно получил данные переговоров от HH.RU ✅
-- **C2**: Claude API вызван, резюме Данилковой оценено ✅
-- **C2b**: ответ Claude разобран ✅
-- **C3**: score < 4 → ветка отказа ✅
-- **C4/C5**: отключены → сообщения НЕ отправлены ✅ (dry run)
-
-### Результаты dry-test поллера (execution #2305):
-- Trigger → Вакансии (404, continueRegularOutput) → Извлечь IDs (fallback: 130853744) → Отклики → Фильтр (0 новых) → стоп
-- **Статус**: success ✅ — все 6 нод прошли
-- **Нет новых откликов**: ожидаемо — staticData.lastProcessedMap[130853744] уже на Данилковой
-
-### ВАЖНО — n8n кеширует расписание:
-После PATCH воркфлоу расписание продолжает выполнять СТАРУЮ версию из памяти.  
-**Решение**: деактивировать → реактивировать:
-```bash
-curl -s -X POST -b "n8n-auth=<COOKIE>" https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/deactivate
-curl -s -X POST -b "n8n-auth=<COOKIE>" -H "Content-Type: application/json" -d '{"versionId":"<VID>"}' \
-  https://oburscuforring.beget.app/rest/workflows/swW1Www0gmme6Yvi/activate
-```
-
-### Что ещё нужно сделать перед боевым запуском (актуально после сессии 3):
-1. **Включить C4/C5/C7/C8** (убрать `disabled: true`) — перед первым боевым тестом
-2. Протестировать A-цепочку: написать боту → получить вопросы → получить вакансию → одобрить → опубликовать
-3. Решить проблему поллера с активными вакансиями (см. раздел 7)
-4. После включения C4/C5 — протестировать отправку сообщения кандидату
+`n8n-nodes-base.telegramTrigger` использует **polling mode** (не webhook). Путь `/webhook/{webhookId}` возвращает 404 — это нормально!
 
 ---
 
 ## 7. Поллер — проблема с вакансиями работодателя
 
-Поллер использует `GET /employers/3565638/vacancies` — но возвращает 0 активных вакансий.
-
-Варианты решения:
-- Жёстко задать список вакансий в Static Data поллера
-- Использовать другой endpoint для получения вакансий менеджера
-- Зарегистрировать настоящий HH.RU webhook (не поллинг)
+Поллер использует `GET /employers/{id}/vacancies` — возвращает 0 активных вакансий.
+Решение в сессии 4: умный кеш в staticData; главный флоу обновляет список раз в час.
+После публикации реальной вакансии заказчиком — поллер подхватит её автоматически.
 
 ---
 
 ## 8. n8n login — командный рецепт
 
-```bash
-# Логин (сохранить cookie)
-curl -s -c /tmp/n8n_cookie.txt \
-  https://oburscuforring.beget.app/rest/login \
-  -H "Content-Type: application/json" \
-  -d '{"emailOrLdapLoginId":"6617911@mail.ru","password":"YOUR_N8N_PASSWORD"}' > /dev/null
+```javascript
+// Через Chrome DevTools / javascript_tool на странице n8n:
+fetch('/rest/workflows/4LXW8oTh168CnTqy')
+  .then(r => r.json()).then(d => { window._wf = d.data; });
 
-# Получить список воркфлоу
-curl -s -b /tmp/n8n_cookie.txt \
-  https://oburscuforring.beget.app/rest/workflows \
-  | python3 -c "import sys,json; ws=json.load(sys.stdin); [print(w.get('id'), w.get('name','')) for w in ws.get('data',[])]"
-
-# Получить воркфлоу
-curl -s -b "n8n-auth=<COOKIE>" https://oburscuforring.beget.app/rest/workflows/4LXW8oTh168CnTqy
-
-# Обновить воркфлоу
-curl -s -X PATCH -b "n8n-auth=<COOKIE>" \
-  -H "Content-Type: application/json" \
-  -d '<FULL_WORKFLOW_JSON>' \
-  https://oburscuforring.beget.app/rest/workflows/4LXW8oTh168CnTqy
+// Обновить workflow:
+fetch('/rest/workflows/4LXW8oTh168CnTqy', {
+  method: 'PATCH',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify(window._wf)
+}).then(r => r.json()).then(d => console.log(d.data?.versionId));
 ```
+
+**Bash через curl не работает из sandbox** — proxy блокирует доступ к oburscuforring.beget.app.  
+Используй Chrome MCP `javascript_tool` на вкладке с открытым n8n.
 
 ---
 
@@ -276,19 +217,23 @@ curl -s -X PATCH -b "n8n-auth=<COOKIE>" \
 ## 10. Следующая сессия — с чего начинать
 
 1. Прочитай этот файл
-2. Залогинься в n8n через Chrome DevTools / JS на странице n8n (Bash-curl не работает из-за proxy)
+2. Открой n8n в браузере (Chrome MCP или вручную)
 3. Убедись что главный флоу активен: `GET /rest/workflows/4LXW8oTh168CnTqy` → `active=true`
 4. C4/C5/C7/C8 уже включены — боевой режим
-5. **Главное:** протестируй A-цепочку — напиши в Telegram-бот, получи вопросы, одобри вакансию
-6. Реши проблему поллера с активными вакансиями (раздел 7)
 
-### Текущее состояние системы (конец сессии 4, 2026-04-20):
-- ✅ Поллер: работает (каждые 5 минут)
-- ✅ Главный флоу: active=True, versionId a05973fa
+### Текущее состояние системы (конец сессии 5, 2026-04-20):
+- ✅ Поллер: работает (каждые 5 минут), умный кеш 60 мин
+- ✅ Главный флоу: active=True, versionId `8ac7ed40-8813-412c-9b42-2542c68a0c22`
 - ✅ C-цепочка: Claude оценивает резюме (score, verdict, rejection text)
-- ✅ C4/C5/C7/C8: **ВКЛЮЧЕНЫ** — боевой режим, сообщения кандидатам будут отправляться
-- ✅ A7: inline-кнопки Telegram (✅ Одобрить / ✏️ Изменить)
-- ✅ A6: claude-sonnet-4-6, структурированный промпт для HH.RU вакансии
-- ✅ Telegram Trigger: polling mode, workflow активен
-- ❓ A-цепочка: **ещё не тестировалась end-to-end** — напиши боту и проверь
-- ❓ Активные вакансии HH.RU: поллер использует fallback 130853744 (архивная)
+- ✅ C4 Отправить отказ: сообщение кандидату в HH.RU работает
+- ✅ C5 Статус: Отказ: **исправлен** — `PUT /negotiations/discard_by_employer/{nid}`
+- ✅ C7 Отправить первый вопрос: включён (accept path, не тестировался)
+- ✅ C8 Статус: В рассмотрении: **исправлен** — `PUT /negotiations/invitation/{nid}` (не тестировался)
+- ❌ A/B-цепочки: удалены, ручное управление вакансиями
+- ✅ ⏰ Проверка вакансий: каждый час (7:00–21:00 МСК)
+- ❓ D-цепочка (диалог): включена, не тестировалась end-to-end
+
+### Что нужно протестировать:
+1. Accept-путь (score ≥ 4): нужен новый реальный отклик с сильным резюме
+2. C8: если вернёт ошибку — смотри execution details, может потребовать body параметры
+3. D-цепочка: ответ кандидата в HH.RU → диалог вопрос-ответ
